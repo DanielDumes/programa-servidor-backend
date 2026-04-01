@@ -1,0 +1,320 @@
+"""
+monitor.py — Hilo daemon de monitoreo automático
+Consulta todos los servidores frecuentemente (30-60s), actualiza el estado actual con TODOS los detalles
+y guarda en historial solo ante cambios o cada hora.
+"""
+import threading
+import time
+import concurrent.futures
+from datetime import datetime, timezone
+
+from storage import load_servers
+from ilo import ilo_get
+from db import get_status_actual, get_historial, get_events
+from config import POLL_INTERVAL, HISTORY_SNAPSHOT_INTERVAL
+
+# Estado previo en memoria para detectar cambios y controlar snapshots por hora
+_prev_states = {}   
+# { server_id: {"health": ..., "power_state": ..., "reachable": ..., "last_history_time": datetime} }
+_lock = threading.Lock()
+
+
+# ── Helpers de Extracción de Datos ───────────────────────────────────────────
+
+def _safe_get(path, host, user, passwd):
+    try:
+        return ilo_get(path, host, user, passwd)
+    except Exception:
+        return {}
+
+def _fetch_storage_details(host, user, passwd):
+    """Obtiene detalles recursivos de almacenamiento (Controladores y Discos)."""
+    try:
+        root = ilo_get("/Systems/1/Storage", host, user, passwd)
+        
+        def fetch_drive(dl):
+            try:
+                d = ilo_get(dl, host, user, passwd)
+                return {
+                    "name":        d.get("Name"),
+                    "model":       d.get("Model", "N/A"),
+                    "capacity_gb": round((d.get("CapacityBytes") or 0) / 1e9, 1),
+                    "type":        d.get("MediaType", "N/A"),
+                    "protocol":    d.get("Protocol", "N/A"),
+                    "rpm":         d.get("RotationSpeedRPM"),
+                    "health":      d.get("Status", {}).get("Health"),
+                }
+            except: return None
+
+        def fetch_controller(link):
+            try:
+                ctrl = ilo_get(link, host, user, passwd)
+                drive_links = [ref.get("@odata.id", "").replace("/redfish/v1", "") for ref in ctrl.get("Drives", [])]
+                drives = []
+                if drive_links:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex_d:
+                        drives = [d for d in ex_d.map(fetch_drive, [dl for dl in drive_links if dl]) if d]
+                return {"name": ctrl.get("Name"), "health": ctrl.get("Status", {}).get("Health"), "drives": drives}
+            except: return None
+
+        links = [m.get("@odata.id", "").replace("/redfish/v1", "") for m in root.get("Members", [])]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex_c:
+            return [c for c in ex_c.map(fetch_controller, [l for l in links if l]) if c]
+    except: return []
+
+def _fetch_memory_details(host, user, passwd):
+    """Obtiene detalles recursivos de memoria (DIMMs)."""
+    try:
+        data = ilo_get("/Systems/1/Memory", host, user, passwd)
+        def fetch_dimm(link):
+            try:
+                m = ilo_get(link, host, user, passwd)
+                if m.get("Status", {}).get("State") == "Absent": return None
+                return {
+                    "name": m.get("Name"), "size_mb": m.get("CapacityMiB", 0),
+                    "speed_mhz": m.get("OperatingSpeedMhz", 0), "type": m.get("MemoryDeviceType", "N/A"),
+                    "health": m.get("Status", {}).get("Health"),
+                }
+            except: return None
+        links = [m.get("@odata.id", "").replace("/redfish/v1", "") for m in data.get("Members", [])]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex_m:
+            return [d for d in ex_m.map(fetch_dimm, [l for l in links if l]) if d]
+    except: return []
+
+
+def poll_server(srv, deep=True):
+    """
+    Consulta un servidor. 
+    - deep=True: Obtiene todo (lento por discos/ram).
+    - deep=False: Solo resumen, temperaturas y energía (rápido).
+    """
+    host, user, passwd = srv["host"], srv["user"], srv["pass"]
+
+    try:
+        # Consultas rápidas (Sistemas, Térmico, Energía)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+            fs = {
+                ex.submit(_safe_get, "/Systems/1",         host, user, passwd): "systems",
+                ex.submit(_safe_get, "/Chassis/1/Thermal", host, user, passwd): "thermal",
+                ex.submit(_safe_get, "/Chassis/1/Power",   host, user, passwd): "power",
+            }
+            if deep:
+                fs[ex.submit(_fetch_storage_details, host, user, passwd)] = "storage"
+                fs[ex.submit(_fetch_memory_details, host, user, passwd)]  = "memory"
+
+            r = {v: k.result() for k, v in fs.items()}
+
+        s, t, p = r["systems"], r["thermal"], r["power"]
+        st = r.get("storage", [])
+        me = r.get("memory", [])
+
+        if not s or not s.get("PowerState"):
+            raise ValueError("Respuesta vacía del iLO")
+
+        ctrl = (p.get("PowerControl") or [{}])[0]
+        temps = [x.get("ReadingCelsius") for x in t.get("Temperatures", []) 
+                 if x.get("Status", {}).get("State") != "Absent" and x.get("ReadingCelsius") is not None]
+        
+        fan_warn = sum(1 for f in t.get("Fans", []) 
+                       if f.get("Status", {}).get("State") != "Absent" and f.get("Status", {}).get("Health") not in ("OK", None))
+
+        # Totales para reporte e inventario
+        ilo_name = s.get("HostName") or s.get("Name", "Servidor iLO")
+        total_mem_gb = s.get("MemorySummary", {}).get("TotalSystemMemoryGiB", 0)
+        
+        # Calcular total de disco sumando todos los drives de todos los controladores
+        total_disk_gb = 0
+        for ctrl_data in st:
+            for drive in ctrl_data.get("drives", []):
+                total_disk_gb += drive.get("capacity_gb", 0)
+
+        return {
+            "server_id":      srv["id"],
+            "server_label":   srv["label"],
+            "server_host":    host,
+            "ilo_name":       ilo_name,
+            "total_mem_gb":   total_mem_gb,
+            "total_storage_gb": round(total_disk_gb, 1),
+            "reachable":      True,
+            "health":         s.get("Status", {}).get("Health"),
+            "health_rollup":  s.get("Status", {}).get("HealthRollup"),
+            "power_state":    s.get("PowerState"),
+            "consumed_watts": ctrl.get("PowerConsumedWatts"),
+            "capacity_watts": ctrl.get("PowerCapacityWatts"),
+            "max_temp_c":     max(temps) if temps else None,
+            "fan_count":      len(t.get("Fans", [])),
+            "fan_warn":       fan_warn,
+            "storage_data":   st,
+            "memory_data":    me,
+            "systems_raw":    s,
+            "thermal_raw":    t,
+            "power_raw":      p,
+            "error":          None,
+        }
+
+    except Exception as e:
+        return {
+            "server_id": srv["id"], "server_label": srv["label"], "server_host": host,
+            "ilo_name": "Error", "total_mem_gb": 0, "total_storage_gb": 0,
+            "reachable": False, "health": None, "health_rollup": None, "power_state": None,
+            "consumed_watts": None, "capacity_watts": None, "max_temp_c": None, "fan_count": 0, "fan_warn": 0,
+            "storage_data": [], "memory_data": [], "error": str(e),
+        }
+
+
+def sync_server_to_db(srv, deep=True):
+    """Polls a server and updates its current state in MongoDB."""
+    snap = poll_server(srv, deep=deep)
+    snap["timestamp"] = datetime.now(timezone.utc)
+    if snap.get("reachable"):
+        get_status_actual().replace_one({"server_id": srv["id"]}, snap, upsert=True)
+    return snap
+
+
+def _detect_and_log_events(snapshot, prev):
+    """
+    Compara snapshot actual vs previo y detecta SOLO cambios reales de hardware.
+    Ignoramos completamente los estados de conexión entre el dashboard y el iLO.
+    Solo generamos eventos cuando el servidor iLO mismo reporta un cambio crítico.
+    """
+    # Si el servidor no responde, NO generamos ningún evento ni alerta.
+    # Esto puede ser un corte temporal de red entre el dashboard y el iLO.
+    if not snapshot["reachable"]:
+        return []
+
+    now    = snapshot["timestamp"]
+    events = []
+
+    # Solo comparar si tenemos un estado previo real del hardware
+    if not prev.get("reachable", True):
+        # El prev era unreachable: ahora volvió. No es un evento de hardware,
+        # solo restauración de conectividad. No loguear nada.
+        return []
+
+    # ── 1. Cambio de Health del sistema ──────────────────────────────────
+    prev_health, curr_health = prev.get("health"), snapshot["health"]
+    if prev_health and curr_health and prev_health != curr_health:
+        severity = "Critical" if curr_health in ("Critical", "Warning") else "Info"
+        etype    = "HealthDegradation" if curr_health in ("Critical", "Warning") else "HealthRecovery"
+        events.append({
+            "timestamp": now, "server_id": snapshot["server_id"],
+            "server_label": snapshot["server_label"], "server": snapshot["server_host"],
+            "type": etype, "severity": severity,
+            "old_status": prev_health, "new_status": curr_health,
+            "details": f"Salud del sistema cambió de {prev_health} a {curr_health}.",
+        })
+
+    # ── 2. Cambio de estado de energía (encendido/apagado) ───────────────
+    prev_power, curr_power = prev.get("power_state"), snapshot["power_state"]
+    if prev_power and curr_power and prev_power != curr_power:
+        severity = "Critical" if curr_power in ("Off", "PoweringOff") else "Info"
+        events.append({
+            "timestamp": now, "server_id": snapshot["server_id"],
+            "server_label": snapshot["server_label"], "server": snapshot["server_host"],
+            "type": "PowerStateChanged", "severity": severity,
+            "old_status": prev_power, "new_status": curr_power,
+            "details": f"El servidor cambió de estado: {prev_power} → {curr_power}.",
+        })
+
+    # ── 3. Ventiladores con fallo (fan_warn > 0 cuando antes era 0) ──────
+    prev_fan_warn, curr_fan_warn = prev.get("fan_warn", 0), snapshot.get("fan_warn", 0)
+    if prev_fan_warn == 0 and curr_fan_warn > 0:
+        events.append({
+            "timestamp": now, "server_id": snapshot["server_id"],
+            "server_label": snapshot["server_label"], "server": snapshot["server_host"],
+            "type": "FanWarning", "severity": "Warning",
+            "old_status": "OK", "new_status": "Warning",
+            "details": f"{curr_fan_warn} ventilador(es) reportan estado anormal.",
+        })
+    elif prev_fan_warn > 0 and curr_fan_warn == 0:
+        events.append({
+            "timestamp": now, "server_id": snapshot["server_id"],
+            "server_label": snapshot["server_label"], "server": snapshot["server_host"],
+            "type": "FanRecovery", "severity": "Info",
+            "old_status": "Warning", "new_status": "OK",
+            "details": "Los ventiladores han vuelto a estado normal.",
+        })
+
+    return events
+
+
+def run_cycle():
+    """Ejecuta un ciclo completo de monitoreo de alta frecuencia con todos los detalles."""
+    servers = load_servers()
+    if not servers: return
+
+    now = datetime.now(timezone.utc)
+    status_col, hist_col, events_col = get_status_actual(), get_historial(), get_events()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        results = list(ex.map(poll_server, servers))
+
+    for snap in results:
+        snap["timestamp"] = now
+        srv_id = snap["server_id"]
+
+        # 1. Actualizar ESTADO ACTUAL solo si el servidor respondió correctamente
+        #    Si no responde, mantenemos el último estado conocido en DB (no sobreescribimos)
+        if snap.get("reachable"):
+            status_col.replace_one({"server_id": srv_id}, snap, upsert=True)
+
+        # 2. Detectar cambios de HARDWARE y manejar HISTORIAL
+        with _lock:
+            prev = _prev_states.get(srv_id, {})
+            events = _detect_and_log_events(snap, prev)
+
+            # El historial por hora SOLO se guarda si el servidor respondió correctamente.
+            # No guardamos snapshots de error (pérdida de conexión dashboard → iLO).
+            last_hist = prev.get("last_history_time")
+            is_new    = not last_hist
+            snap_save_time = last_hist  # Por defecto, no actualizamos el tiempo
+
+            if snap.get("reachable"):
+                if is_new or len(events) > 0 or (now - last_hist).total_seconds() >= HISTORY_SNAPSHOT_INTERVAL:
+                    hist_col.insert_one(snap)
+                    snap_save_time = now
+
+            if events:
+                events_col.insert_many(events)
+                for ev in events:
+                    # Emitir alerta real-time via Socket.IO
+                    if _socketio:
+                        try:
+                            # Serializar fecha para el socket
+                            ev_copy = ev.copy()
+                            if isinstance(ev_copy["timestamp"], datetime):
+                                ev_copy["timestamp"] = ev_copy["timestamp"].isoformat()
+                            _socketio.emit('new_alert', ev_copy, namespace='/')
+                        except Exception as ex_emit:
+                            print(f"[Monitor] Error emitiendo socket: {ex_emit}")
+                    
+                    if ev["severity"] == "Critical": print(f"!!! ALERTA CRÍTICA: {ev['server_label']} - {ev['details']}")
+            
+            _prev_states[srv_id] = {
+                "reachable":        snap["reachable"],
+                "health":           snap.get("health"),
+                "power_state":      snap.get("power_state"),
+                "fan_warn":         snap.get("fan_warn", 0),
+                "last_history_time": snap_save_time
+            }
+
+    # Emitir señal de fin de ciclo para refresco de UI en tiempo real
+    if _socketio:
+        _socketio.emit('fleet_update', {"timestamp": now.isoformat()}, namespace='/')
+
+
+def _monitor_loop():
+    """Bucle infinito del hilo daemon."""
+    while True:
+        try: run_cycle()
+        except Exception as e: print(f"[Monitor] Error fatal en ciclo: {e}")
+        time.sleep(POLL_INTERVAL)
+
+
+def start_monitor(socketio_instance=None):
+    """Arranca el hilo daemon de monitoreo."""
+    global _socketio
+    _socketio = socketio_instance
+    t = threading.Thread(target=_monitor_loop, name="ilo-monitor", daemon=True)
+    t.start()
+    print(f"[Monitor] Hilo iniciado (SocketIO {'Activado' if _socketio else 'Desactivado'}). Polling: {POLL_INTERVAL}s.")
