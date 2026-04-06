@@ -7,31 +7,34 @@ from config import ILO_TIMEOUT
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def ilo_get(path, host, user, passwd, retries=2, session=None):
-    url = f"https://{host}/redfish/v1{path}"
-    last_err = None
-    getter = session.get if session else requests.get
+    # Asegurar que el path no tenga el prefijo /redfish/v1 si ilo_get lo va a añadir
+    clean_path = path if not path.startswith("/redfish/v1") else path.replace("/redfish/v1", "")
+    url = f"https://{host}/redfish/v1{clean_path}"
     
-    # Si la sesión ya tiene auth configurado, no lo pasamos en el get para evitar conflictos
-    current_auth = (user, passwd) if not (session and session.auth) else None
+    last_err = None
+    kwargs = {
+        "verify": False,
+        "timeout": ILO_TIMEOUT,
+        "headers": {"Accept": "application/json", "OData-Version": "4.0"}
+    }
+    
+    # Si la sesión NO tiene auth configurado, o si no hay sesión, usamos auth explícito
+    if not session or not session.auth:
+        kwargs["auth"] = (user, passwd)
+    
+    getter = session.get if session else requests.get
     
     for i in range(retries + 1):
         try:
-            resp = getter(
-                url,
-                auth=current_auth,
-                verify=False,
-                timeout=ILO_TIMEOUT,
-                headers={"Accept": "application/json", "OData-Version": "4.0"}
-            )
+            resp = getter(url, **kwargs)
             resp.raise_for_status()
             return resp.json()
         except (requests.exceptions.RequestException, ValueError) as e:
             last_err = e
             if i < retries:
                 import time
-                time.sleep(1) # Pequeña espera antes de reintentar
+                time.sleep(1)
                 continue
-    # Si llegamos aquí, fallaron todos los intentos
     raise last_err
 
 def handle_errors(f):

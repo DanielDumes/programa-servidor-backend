@@ -48,7 +48,7 @@ def debug_storage_deep(host, user, passwd):
 
 if __name__ == "__main__":
     col = get_servers_col()
-    srv = col.find_one({"host": "10.11.12.8"}) # Focusing on SRV-3 which responded before
+    srv = col.find_one({"host": "10.11.12.6"}) # Focusing on SRV-10
     if srv:
         debug_storage_deep(srv['host'], srv['user'], srv['pass'])
     else:

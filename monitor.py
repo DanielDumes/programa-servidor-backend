@@ -69,14 +69,23 @@ def _fetch_storage_details(host, user, passwd, prev_storage=None, session=None):
             for cl in ctrl_links:
                 try:
                     ctrl = ilo_get(cl, host, user, passwd, session=session)
-                    # Buscar componentes (Drives, Volumes, LogicalDrives, PhysicalDrives)
+                    # Buscar componentes de forma más agresiva (Drives, Volumes, LogicalDrives, PhysicalDrives)
                     all_comp_links = []
+                    
+                    # 1. Rutas estándar en la raíz del controlador
                     all_comp_links += _get_links(ctrl.get("Drives"), host, user, passwd, session)
                     all_comp_links += _get_links(ctrl.get("Volumes"), host, user, passwd, session)
-                    if "Links" in ctrl:
-                        all_comp_links += _get_links(ctrl["Links"].get("Drives"), host, user, passwd, session)
-                        all_comp_links += _get_links(ctrl["Links"].get("LogicalDrives"), host, user, passwd, session)
-                        all_comp_links += _get_links(ctrl["Links"].get("PhysicalDrives"), host, user, passwd, session)
+                    
+                    # 2. Rutas en objeto Links
+                    lks = ctrl.get("Links", {})
+                    all_comp_links += _get_links(lks.get("Drives"), host, user, passwd, session)
+                    all_comp_links += _get_links(lks.get("LogicalDrives"), host, user, passwd, session)
+                    all_comp_links += _get_links(lks.get("PhysicalDrives"), host, user, passwd, session)
+                    
+                    # 3. Oem-Specific (HPE SmartStorage suele anidar aquí)
+                    oem_hpe = ctrl.get("Oem", {}).get("Hpe", {})
+                    all_comp_links += _get_links(oem_hpe.get("Links", {}).get("LogicalDrives"), host, user, passwd, session)
+                    all_comp_links += _get_links(oem_hpe.get("Links", {}).get("PhysicalDrives"), host, user, passwd, session)
                     
                     # Deduplicar links
                     all_comp_links = list(dict.fromkeys(all_comp_links))
@@ -87,17 +96,17 @@ def _fetch_storage_details(host, user, passwd, prev_storage=None, session=None):
                             d = ilo_get(dl, host, user, passwd, session=session)
                             if not d: continue
                             
-                            # Capacidad (Bytes o MiB)
+                            # Intentar obtener capacidad de varias fuentes
                             bv = d.get("CapacityBytes")
                             if bv is None:
                                 mv = d.get("CapacityMiB")
                                 if mv: bv = mv * 1024 * 1024
                             
-                            # Si sigue siendo 0, intentamos sacar del nombre (ej: "960GB...")
+                            # Si sigue siendo 0 o None, intentamos sacar del nombre o descripción (ej: "960GB...")
                             if not bv:
-                                name = d.get("Name", "")
+                                text_to_search = f"{d.get('Name','')} {d.get('Model','')} {d.get('Description','')}"
                                 import re
-                                match = re.search(r"(\d+)\s*(GB|TB|GiB|TiB)", name, re.I)
+                                match = re.search(r"(\d+)\s*(GB|TB|GiB|TiB)", text_to_search, re.I)
                                 if match:
                                     val, unit = int(match.group(1)), match.group(2).upper()
                                     mult = 1e12 if "T" in unit else 1e9
@@ -105,17 +114,17 @@ def _fetch_storage_details(host, user, passwd, prev_storage=None, session=None):
 
                             drives.append({
                                 "name":        d.get("Name") or d.get("Id") or f"Drive {dl.split('/')[-1]}",
-                                "model":       d.get("Model", d.get("Manufacturer", "N/A")),
+                                "model":       d.get("Model") or d.get("Manufacturer") or "N/A",
                                 "capacity_gb": round((bv or 0) / 1e9, 1),
-                                "type":        d.get("MediaType", "N/A"),
+                                "type":        d.get("MediaType") or d.get("Protocol") or "N/A",
                                 "protocol":    d.get("Protocol", "N/A"),
-                                "health":      d.get("Status", {}).get("Health"),
+                                "health":      d.get("Status", {}).get("Health") or "OK",
                             })
                         except Exception: continue
                     
                     controllers.append({
                         "name": ctrl.get("Name", "Controller"),
-                        "health": ctrl.get("Status", {}).get("Health"),
+                        "health": ctrl.get("Status", {}).get("Health") or "OK",
                         "drives": drives
                     })
                 except Exception: continue
