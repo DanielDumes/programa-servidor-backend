@@ -37,8 +37,9 @@ def server_summary(server_id):
             "health":        s.get("Status", {}).get("Health", "Unknown"),
             "health_rollup": s.get("Status", {}).get("HealthRollup", "Unknown"),
             "memory_gib":    s.get("MemorySummary", {}).get("TotalSystemMemoryGiB", 0),
-            "cpu_count":     s.get("ProcessorSummary", {}).get("Count", 0),
-            "cpu_model":     s.get("ProcessorSummary", {}).get("Model", "N/A"),
+            "cpu_count":         s.get("ProcessorSummary", {}).get("Count", 0),
+            "logical_cpu_count": snap.get("total_cpu_threads") or s.get("ProcessorSummary", {}).get("LogicalProcessorCount", 0),
+            "cpu_model":         s.get("ProcessorSummary", {}).get("Model", "N/A"),
         },
         "temperatures": [
             {
@@ -47,6 +48,7 @@ def server_summary(server_id):
                 "upper_caution":  x.get("UpperThresholdNonCritical"),
                 "upper_critical": x.get("UpperThresholdCritical"),
                 "health":         x.get("Status", {}).get("Health", "Unknown"),
+                "location":       x.get("PhysicalContext"),
             }
             for x in t.get("Temperatures", [])
             if x.get("Status", {}).get("State") != "Absent"

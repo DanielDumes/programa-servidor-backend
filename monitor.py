@@ -95,14 +95,24 @@ def _fetch_storage_details(host, user, passwd, prev_storage=None, session=None):
                         try:
                             d = ilo_get(dl, host, user, passwd, session=session)
                             if not d: continue
+
+                            # Saltar volúmenes RAW (son el disco físico presentado como volumen,
+                            # ya están contados vía la ruta Drives - evita duplicados)
+                            if d.get("VolumeType") == "RawDevice":
+                                continue
                             
                             # Intentar obtener capacidad de varias fuentes
                             bv = d.get("CapacityBytes")
                             if bv is None:
                                 mv = d.get("CapacityMiB")
                                 if mv: bv = mv * 1024 * 1024
-                            
-                            # Si sigue siendo 0 o None, intentamos sacar del nombre o descripción (ej: "960GB...")
+
+                            # CapacityGB — campo específico de HPE SmartStorage
+                            if not bv:
+                                gb = d.get("CapacityGB")
+                                if gb is not None: bv = float(gb) * 1e9
+
+                            # Si sigue siendo 0 o None, intentamos sacar del nombre o descripción
                             if not bv:
                                 text_to_search = f"{d.get('Name','')} {d.get('Model','')} {d.get('Description','')}"
                                 import re
@@ -111,6 +121,17 @@ def _fetch_storage_details(host, user, passwd, prev_storage=None, session=None):
                                     val, unit = int(match.group(1)), match.group(2).upper()
                                     mult = 1e12 if "T" in unit else 1e9
                                     bv = val * mult
+
+                            # Sanity check: si CapacityBytes parece demasiado pequeño para un
+                            # disco de servidor (< 1 GB), intentar extraer capacidad del modelo.
+                            # Convención HPE: "MK000960GWUGH" → 960 GB (dígitos antes de 'G')
+                            if not bv or bv < 1e9:
+                                model_str = d.get("Model") or d.get("Name") or ""
+                                import re as _re
+                                # Patrón HPE: 2 letras + ceros + capacidad en GB + G + letra
+                                m2 = _re.search(r"[A-Z]{2}0*(\d{2,4})G[A-Z]", model_str)
+                                if m2:
+                                    bv = int(m2.group(1)) * 1e9
 
                             drives.append({
                                 "name":        d.get("Name") or d.get("Id") or f"Drive {dl.split('/')[-1]}",
@@ -204,7 +225,20 @@ def poll_server(srv, deep=True, prev_snap=None):
             # Totales para reporte e inventario
             ilo_name = s.get("HostName") or s.get("Name", "Servidor iLO")
             total_mem_gb = s.get("MemorySummary", {}).get("TotalSystemMemoryGiB", 0)
-            
+
+            # ── Hilos lógicos totales reales ──────────────────────────────
+            # 1. Intentar campo directo del summary (no siempre disponible en iLO 5)
+            total_cpu_threads = s.get("ProcessorSummary", {}).get("LogicalProcessorCount", 0)
+            if not total_cpu_threads:
+                # 2. Fallback: consultar cada procesador y sumar TotalThreads
+                try:
+                    proc_links = _get_links("/Systems/1/Processors", host, user, passwd, session)
+                    for pl in proc_links:
+                        proc = _safe_get(pl, host, user, passwd, session)
+                        total_cpu_threads += proc.get("TotalThreads", 0)
+                except Exception:
+                    total_cpu_threads = 0
+
             # Calcular total de disco sumando todos los drives de todos los controladores
             total_disk_gb = 0
             for ctrl_data in st:
@@ -218,6 +252,7 @@ def poll_server(srv, deep=True, prev_snap=None):
                 "ilo_name":       ilo_name,
                 "total_mem_gb":   total_mem_gb,
                 "total_storage_gb": round(total_disk_gb, 1),
+                "total_cpu_threads": total_cpu_threads,
                 "reachable":      True,
                 "health":         s.get("Status", {}).get("Health"),
                 "health_rollup":  s.get("Status", {}).get("HealthRollup"),
