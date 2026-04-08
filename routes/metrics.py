@@ -55,10 +55,15 @@ def server_summary(server_id):
             and x.get("ReadingCelsius") is not None
         ],
         "fans": [
-            {"name": f.get("Name"), "rpm": f.get("Reading"), "health": f.get("Status", {}).get("Health")}
+            {
+                "name": f.get("Name") or f.get("FanName"),
+                "rpm": f.get("Reading") or f.get("CurrentReading"),
+                "health": f.get("Status", {}).get("Health")
+            }
             for f in t.get("Fans", [])
             if f.get("Status", {}).get("State") != "Absent"
         ],
+
         "power": {
             "consumed_watts": ctrl.get("PowerConsumedWatts"),
             "capacity_watts": ctrl.get("PowerCapacityWatts"),

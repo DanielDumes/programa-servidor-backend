@@ -62,8 +62,9 @@ def _fetch_storage_details(host, user, passwd, prev_storage=None, session=None):
     """Obtiene detalles de almacenamiento de forma SECUENCIAL y RECURSIVA."""
     controllers = []
     
-    # Rutas para buscar controladores
-    for path in ["/Systems/1/Storage", "/Systems/1/SmartStorage"]:
+    # Rutas para buscar controladores (iLO 5 usa /Storage, iLO 4 usa /SmartStorage/ArrayControllers)
+    for path in ["/Systems/1/Storage", "/Systems/1/SmartStorage", "/Systems/1/SmartStorage/ArrayControllers"]:
+
         try:
             ctrl_links = _get_links(path, host, user, passwd, session)
             for cl in ctrl_links:
@@ -78,14 +79,20 @@ def _fetch_storage_details(host, user, passwd, prev_storage=None, session=None):
                     
                     # 2. Rutas en objeto Links
                     lks = ctrl.get("Links", {})
-                    all_comp_links += _get_links(lks.get("Drives"), host, user, passwd, session)
-                    all_comp_links += _get_links(lks.get("LogicalDrives"), host, user, passwd, session)
-                    all_comp_links += _get_links(lks.get("PhysicalDrives"), host, user, passwd, session)
+                    all_comp_links += _get_links(lks.get("Drives"), host, user, passwd)
+                    all_comp_links += _get_links(lks.get("LogicalDrives"), host, user, passwd)
+                    all_comp_links += _get_links(lks.get("PhysicalDrives"), host, user, passwd)
+                    all_comp_links += _get_links(lks.get("DiskDrives"), host, user, passwd) # Ruta iLO 4 específica
+
                     
                     # 3. Oem-Specific (HPE SmartStorage suele anidar aquí)
-                    oem_hpe = ctrl.get("Oem", {}).get("Hpe", {})
-                    all_comp_links += _get_links(oem_hpe.get("Links", {}).get("LogicalDrives"), host, user, passwd, session)
-                    all_comp_links += _get_links(oem_hpe.get("Links", {}).get("PhysicalDrives"), host, user, passwd, session)
+                    oem_hpe = ctrl.get("Oem", {}).get("Hp", {}) # Cambiado a .get("Hp") para iLO 4
+                    if not oem_hpe: oem_hpe = ctrl.get("Oem", {}).get("Hpe", {})
+                    
+                    lks_oem = oem_hpe.get("Links", {})
+                    all_comp_links += _get_links(lks_oem.get("LogicalDrives"), host, user, passwd, session)
+                    all_comp_links += _get_links(lks_oem.get("PhysicalDrives"), host, user, passwd, session)
+
                     
                     # Deduplicar links
                     all_comp_links = list(dict.fromkeys(all_comp_links))
@@ -107,10 +114,11 @@ def _fetch_storage_details(host, user, passwd, prev_storage=None, session=None):
                                 mv = d.get("CapacityMiB")
                                 if mv: bv = mv * 1024 * 1024
 
-                            # CapacityGB — campo específico de HPE SmartStorage
+                            # CapacityGB — campo específico de HPE SmartStorage (iLO 4)
                             if not bv:
                                 gb = d.get("CapacityGB")
-                                if gb is not None: bv = float(gb) * 1e9
+                                if gb is not None: bv = float(gb) * 1000 * 1000 * 1000
+
 
                             # Si sigue siendo 0 o None, intentamos sacar del nombre o descripción
                             if not bv:
@@ -136,11 +144,12 @@ def _fetch_storage_details(host, user, passwd, prev_storage=None, session=None):
                             drives.append({
                                 "name":        d.get("Name") or d.get("Id") or f"Drive {dl.split('/')[-1]}",
                                 "model":       d.get("Model") or d.get("Manufacturer") or "N/A",
-                                "capacity_gb": round((bv or 0) / 1e9, 1),
+                                "capacity_gb": round((bv or 0) / 1000000000, 1), # Usar división estándar decimal por seguridad
                                 "type":        d.get("MediaType") or d.get("Protocol") or "N/A",
                                 "protocol":    d.get("Protocol", "N/A"),
                                 "health":      d.get("Status", {}).get("Health") or "OK",
                             })
+
                         except Exception: continue
                     
                     controllers.append({
@@ -164,12 +173,14 @@ def _fetch_memory_details(host, user, passwd, prev_memory=None, session=None):
                 m = ilo_get(ml, host, user, passwd, session=session)
                 if m.get("Status", {}).get("State") == "Absent": continue
                 results.append({
-                    "name": m.get("Name") or m.get("Id"), 
-                    "size_mb": m.get("CapacityMiB", 0),
-                    "speed_mhz": m.get("OperatingSpeedMhz", 0), 
-                    "type": m.get("MemoryDeviceType", "N/A"),
-                    "health": m.get("Status", {}).get("Health"),
+                    "name": m.get("Name") or m.get("Id") or m.get("SocketLocator"), 
+                    "size_mb": m.get("CapacityMiB") or m.get("SizeMB") or 0,
+                    "speed_mhz": m.get("OperatingSpeedMhz") or m.get("MaximumFrequencyMHz") or 0,
+                    "type": m.get("MemoryDeviceType") or m.get("DIMMType") or "N/A",
+                    "health": m.get("Status", {}).get("Health") or "OK",
                 })
+
+
             except Exception: continue
         
         if prev_memory and len(results) < len(prev_memory):
@@ -190,103 +201,100 @@ def poll_server(srv, deep=True, prev_snap=None):
     """
     host, user, passwd = srv["host"], srv["user"], srv["pass"]
 
-    # Usar una sesión persistente por servidor para evitar saturar el iLO
-    import requests
-    with requests.Session() as session:
-        session.auth = (user, passwd) # Autenticación a nivel de sesión
-        try:
-            # Consultas SECUENCIALES para máxima estabilidad en iLO 5 (Gen10)
-            # El uso de Session Keep-Alive hace que sea rápido sin romper el iLO
-            r = {
-                "systems": _safe_get("/Systems/1",         host, user, passwd, session),
-                "thermal": _safe_get("/Chassis/1/Thermal", host, user, passwd, session),
-                "power":   _safe_get("/Chassis/1/Power",   host, user, passwd, session),
-            }
-            if deep:
-                p_storage = prev_snap.get("storage_data") if prev_snap else None
-                p_memory  = prev_snap.get("memory_data")  if prev_snap else None
-                r["storage"] = _fetch_storage_details(host, user, passwd, p_storage, session)
-                r["memory"]  = _fetch_memory_details(host, user, passwd, p_memory,  session)
+    # ── Ejecución de Consultas ──────────────────────────────
+    try:
+        # Consultas SECUENCIALES para máxima estabilidad
+        r = {
+            "systems": _safe_get("/Systems/1",         host, user, passwd),
+            "thermal": _safe_get("/Chassis/1/Thermal", host, user, passwd),
+            "power":   _safe_get("/Chassis/1/Power",   host, user, passwd),
+        }
+        
+        if deep:
+            p_storage = prev_snap.get("storage_data") if prev_snap else None
+            p_memory  = prev_snap.get("memory_data")  if prev_snap else None
+            r["storage"] = _fetch_storage_details(host, user, passwd, p_storage)
+            r["memory"]  = _fetch_memory_details(host, user, passwd, p_memory)
 
-            s, t, p = r["systems"], r["thermal"], r["power"]
-            st = r.get("storage", [])
-            me = r.get("memory", [])
+        s, t, p = r["systems"], r["thermal"], r["power"]
+        st = r.get("storage", [])
+        me = r.get("memory", [])
 
-            if not s or not s.get("PowerState"):
-                raise ValueError("Respuesta vacía del iLO")
+        if not s or not s.get("PowerState"):
+            raise ValueError("Respuesta vacía del iLO")
 
-            ctrl = (p.get("PowerControl") or [{}])[0]
-            # ── Extracción de Temperaturas (Priorizar Inlet Ambient para Reportes) ──
-            all_temps = t.get("Temperatures", [])
-            inlet_temp = next((x.get("ReadingCelsius") for x in all_temps 
-                               if (x.get("Name") == "01-Inlet Ambient" or x.get("MemberId") == "01-Inlet Ambient")), None)
-            
-            if inlet_temp is None:
-                # Fallback: Máximo de sensores disponibles
-                temps_raw = [x.get("ReadingCelsius") for x in all_temps 
-                             if x.get("Status", {}).get("State") != "Absent" and x.get("ReadingCelsius") is not None]
-                inlet_temp = max(temps_raw) if temps_raw else None
+        ctrl = (p.get("PowerControl") or [{}])[0]
+        # ── Extracción de Temperaturas (Priorizar Inlet Ambient para Reportes) ──
+        all_temps = t.get("Temperatures", [])
+        inlet_temp = next((x.get("ReadingCelsius") for x in all_temps 
+                           if (x.get("Name") == "01-Inlet Ambient" or x.get("MemberId") == "01-Inlet Ambient")), None)
+        
+        if inlet_temp is None:
+            # Fallback: Máximo de sensores disponibles
+            temps_raw = [x.get("ReadingCelsius") for x in all_temps 
+                         if x.get("Status", {}).get("State") != "Absent" and x.get("ReadingCelsius") is not None]
+            inlet_temp = max(temps_raw) if temps_raw else None
 
-            
-            fan_warn = sum(1 for f in t.get("Fans", []) 
-                           if f.get("Status", {}).get("State") != "Absent" and f.get("Status", {}).get("Health") not in ("OK", None))
+        
+        fan_warn = sum(1 for f in t.get("Fans", []) 
+                       if f.get("Status", {}).get("State") != "Absent" and f.get("Status", {}).get("Health") not in ("OK", None))
 
-            # Totales para reporte e inventario
-            ilo_name = s.get("HostName") or s.get("Name", "Servidor iLO")
-            total_mem_gb = s.get("MemorySummary", {}).get("TotalSystemMemoryGiB", 0)
+        # Totales para reporte e inventario
+        ilo_name = s.get("HostName") or s.get("Name", "Servidor iLO")
+        total_mem_gb = s.get("MemorySummary", {}).get("TotalSystemMemoryGiB", 0)
 
-            # ── Hilos lógicos totales reales ──────────────────────────────
-            # 1. Intentar campo directo del summary (no siempre disponible en iLO 5)
-            total_cpu_threads = s.get("ProcessorSummary", {}).get("LogicalProcessorCount", 0)
-            if not total_cpu_threads:
-                # 2. Fallback: consultar cada procesador y sumar TotalThreads
-                try:
-                    proc_links = _get_links("/Systems/1/Processors", host, user, passwd, session)
-                    for pl in proc_links:
-                        proc = _safe_get(pl, host, user, passwd, session)
-                        total_cpu_threads += proc.get("TotalThreads", 0)
-                except Exception:
-                    total_cpu_threads = 0
+        # ── Hilos lógicos totales reales ──────────────────────────────
+        total_cpu_threads = s.get("ProcessorSummary", {}).get("LogicalProcessorCount", 0)
+        if not total_cpu_threads:
+            # Fallback: consultar cada procesador y sumar TotalThreads
+            try:
+                proc_links = _get_links("/Systems/1/Processors", host, user, passwd)
+                for pl in proc_links:
+                    proc = _safe_get(pl, host, user, passwd)
+                    total_cpu_threads += proc.get("TotalThreads", 0)
+            except Exception:
+                total_cpu_threads = 0
 
-            # Calcular total de disco sumando todos los drives de todos los controladores
-            total_disk_gb = 0
-            for ctrl_data in st:
-                for drive in ctrl_data.get("drives", []):
-                    total_disk_gb += drive.get("capacity_gb", 0)
+        # Calcular total de disco sumando todos los drives de todos los controladores
+        total_disk_gb = 0
+        for ctrl_data in st:
+            for drive in ctrl_data.get("drives", []):
+                total_disk_gb += drive.get("capacity_gb", 0)
 
-            return {
-                "server_id":      srv["id"],
-                "server_label":   srv["label"],
-                "server_host":    host,
-                "ilo_name":       ilo_name,
-                "total_mem_gb":   total_mem_gb,
-                "total_storage_gb": round(total_disk_gb, 1),
-                "total_cpu_threads": total_cpu_threads,
-                "reachable":      True,
-                "health":         s.get("Status", {}).get("Health"),
-                "health_rollup":  s.get("Status", {}).get("HealthRollup"),
-                "power_state":    s.get("PowerState"),
-                "consumed_watts": ctrl.get("PowerConsumedWatts"),
-                "capacity_watts": ctrl.get("PowerCapacityWatts"),
-                "max_temp_c":     inlet_temp,
+        return {
+            "server_id":      srv["id"],
+            "server_label":   srv["label"],
+            "server_host":    host,
+            "ilo_name":       ilo_name,
+            "total_mem_gb":   total_mem_gb,
+            "total_storage_gb": round(total_disk_gb, 1),
+            "total_cpu_threads": total_cpu_threads,
+            "reachable":      True,
+            "health":         s.get("Status", {}).get("Health"),
+            "health_rollup":  s.get("Status", {}).get("HealthRollup"),
+            "power_state":    s.get("PowerState"),
+            "consumed_watts": ctrl.get("PowerConsumedWatts"),
+            "capacity_watts": ctrl.get("PowerCapacityWatts"),
+            "max_temp_c":     inlet_temp,
 
-                "fan_count":      len(t.get("Fans", [])),
-                "fan_warn":       fan_warn,
-                "storage_data":   st,
-                "memory_data":    me,
-                "systems_raw":    s,
-                "thermal_raw":    t,
-                "power_raw":      p,
-                "error":          None,
-            }
-        except Exception as e:
-            return {
-                "server_id": srv["id"], "server_label": srv["label"], "server_host": host,
-                "ilo_name": "Error", "total_mem_gb": 0, "total_storage_gb": 0,
-                "reachable": False, "health": None, "health_rollup": None, "power_state": None,
-                "consumed_watts": None, "capacity_watts": None, "max_temp_c": None, "fan_count": 0, "fan_warn": 0,
-                "storage_data": [], "memory_data": [], "error": str(e),
-            }
+            "fan_count":      len(t.get("Fans", [])),
+            "fan_warn":       fan_warn,
+            "storage_data":   st,
+            "memory_data":    me,
+            "systems_raw":    s,
+            "thermal_raw":    t,
+            "power_raw":      p,
+            "error":          None,
+        }
+    except Exception as e:
+        return {
+            "server_id": srv["id"], "server_label": srv["label"], "server_host": host,
+            "ilo_name": "Error", "total_mem_gb": 0, "total_storage_gb": 0,
+            "reachable": False, "health": None, "health_rollup": None, "power_state": None,
+            "consumed_watts": None, "capacity_watts": None, "max_temp_c": None, "fan_count": 0, "fan_warn": 0,
+            "storage_data": [], "memory_data": [], "error": str(e),
+        }
+
 
 
 def sync_server_to_db(srv, deep=True):
