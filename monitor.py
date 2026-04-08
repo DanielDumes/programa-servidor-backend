@@ -216,8 +216,17 @@ def poll_server(srv, deep=True, prev_snap=None):
                 raise ValueError("Respuesta vacía del iLO")
 
             ctrl = (p.get("PowerControl") or [{}])[0]
-            temps = [x.get("ReadingCelsius") for x in t.get("Temperatures", []) 
-                     if x.get("Status", {}).get("State") != "Absent" and x.get("ReadingCelsius") is not None]
+            # ── Extracción de Temperaturas (Priorizar Inlet Ambient para Reportes) ──
+            all_temps = t.get("Temperatures", [])
+            inlet_temp = next((x.get("ReadingCelsius") for x in all_temps 
+                               if (x.get("Name") == "01-Inlet Ambient" or x.get("MemberId") == "01-Inlet Ambient")), None)
+            
+            if inlet_temp is None:
+                # Fallback: Máximo de sensores disponibles
+                temps_raw = [x.get("ReadingCelsius") for x in all_temps 
+                             if x.get("Status", {}).get("State") != "Absent" and x.get("ReadingCelsius") is not None]
+                inlet_temp = max(temps_raw) if temps_raw else None
+
             
             fan_warn = sum(1 for f in t.get("Fans", []) 
                            if f.get("Status", {}).get("State") != "Absent" and f.get("Status", {}).get("Health") not in ("OK", None))
@@ -259,7 +268,8 @@ def poll_server(srv, deep=True, prev_snap=None):
                 "power_state":    s.get("PowerState"),
                 "consumed_watts": ctrl.get("PowerConsumedWatts"),
                 "capacity_watts": ctrl.get("PowerCapacityWatts"),
-                "max_temp_c":     max(temps) if temps else None,
+                "max_temp_c":     inlet_temp,
+
                 "fan_count":      len(t.get("Fans", [])),
                 "fan_warn":       fan_warn,
                 "storage_data":   st,
