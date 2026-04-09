@@ -58,7 +58,8 @@ def server_summary(server_id):
             {
                 "name": f.get("Name") or f.get("FanName"),
                 "rpm": f.get("Reading") or f.get("CurrentReading"),
-                "health": f.get("Status", {}).get("Health")
+                "health": f.get("Status", {}).get("Health"),
+                "units": f.get("Units") or f.get("ReadingUnits") or "RPM"
             }
             for f in t.get("Fans", [])
             if f.get("Status", {}).get("State") != "Absent"

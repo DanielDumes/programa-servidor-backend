@@ -6,6 +6,7 @@ y guarda en historial solo ante cambios o cada hora.
 import threading
 import time
 import concurrent.futures
+import re
 from datetime import datetime, timezone
 
 from storage import load_servers
@@ -59,10 +60,16 @@ def _get_links(obj_or_path, host, user, passwd, session=None):
     return [l for l in links if l]
 
 def _fetch_storage_details(host, user, passwd, prev_storage=None, session=None):
-    """Obtiene detalles de almacenamiento de forma SECUENCIAL y RECURSIVA."""
+    """
+    Obtiene detalles de almacenamiento.
+    - Intenta /Systems/1/Storage (estándar Redfish, iLO 5).
+    - Solo si esa ruta no devuelve nada, prueba las rutas OEM de SmartStorage (iLO 4).
+    Esto evita duplicados en iLO 5, donde ambas APIs exponen el mismo controlador.
+    """
     controllers = []
     
-    # Rutas para buscar controladores (iLO 5 usa /Storage, iLO 4 usa /SmartStorage/ArrayControllers)
+    # Rutas en orden de preferencia. Hacemos break en cuanto encontremos datos válidos.
+    # iLO 5: /Storage devuelve todo. iLO 4: /Storage puede estar vacío y necesita SmartStorage.
     for path in ["/Systems/1/Storage", "/Systems/1/SmartStorage", "/Systems/1/SmartStorage/ArrayControllers"]:
 
         try:
@@ -70,7 +77,7 @@ def _fetch_storage_details(host, user, passwd, prev_storage=None, session=None):
             for cl in ctrl_links:
                 try:
                     ctrl = ilo_get(cl, host, user, passwd, session=session)
-                    # Buscar componentes de forma más agresiva (Drives, Volumes, LogicalDrives, PhysicalDrives)
+                    # Buscar componentes (Drives, Volumes, LogicalDrives, PhysicalDrives)
                     all_comp_links = []
                     
                     # 1. Rutas estándar en la raíz del controlador
@@ -82,85 +89,145 @@ def _fetch_storage_details(host, user, passwd, prev_storage=None, session=None):
                     all_comp_links += _get_links(lks.get("Drives"), host, user, passwd)
                     all_comp_links += _get_links(lks.get("LogicalDrives"), host, user, passwd)
                     all_comp_links += _get_links(lks.get("PhysicalDrives"), host, user, passwd)
-                    all_comp_links += _get_links(lks.get("DiskDrives"), host, user, passwd) # Ruta iLO 4 específica
+                    all_comp_links += _get_links(lks.get("DiskDrives"), host, user, passwd)  # iLO 4
 
-                    
-                    # 3. Oem-Specific (HPE SmartStorage suele anidar aquí)
-                    oem_hpe = ctrl.get("Oem", {}).get("Hp", {}) # Cambiado a .get("Hp") para iLO 4
+                    # 3. OEM-Specific (HPE SmartStorage)
+                    oem_hpe = ctrl.get("Oem", {}).get("Hp", {})
                     if not oem_hpe: oem_hpe = ctrl.get("Oem", {}).get("Hpe", {})
-                    
                     lks_oem = oem_hpe.get("Links", {})
                     all_comp_links += _get_links(lks_oem.get("LogicalDrives"), host, user, passwd, session)
                     all_comp_links += _get_links(lks_oem.get("PhysicalDrives"), host, user, passwd, session)
 
-                    
                     # Deduplicar links
                     all_comp_links = list(dict.fromkeys(all_comp_links))
                     
-                    drives = []
-                    for dl in all_comp_links:
+                    all_drives_data = {} # @odata.id -> data
+                    volumes_data = []    # list of volumes
+                    
+                    # 1. Obtener links de TODO
+                    physical_links = []
+                    logical_links = []
+                    
+                    # Rutas estándar
+                    physical_links += _get_links(ctrl.get("Drives"), host, user, passwd, session)
+                    logical_links  += _get_links(ctrl.get("Volumes"), host, user, passwd, session)
+                    
+                    # Rutas en Links
+                    lks = ctrl.get("Links", {})
+                    physical_links += _get_links(lks.get("Drives"), host, user, passwd)
+                    physical_links += _get_links(lks.get("PhysicalDrives"), host, user, passwd)
+                    physical_links += _get_links(lks.get("DiskDrives"), host, user, passwd)
+                    logical_links  += _get_links(lks.get("LogicalDrives"), host, user, passwd)
+                    logical_links  += _get_links(lks.get("Volumes"), host, user, passwd) # redundante pero seguro
+                    
+                    # OEM-Specific
+                    oem_hpe = ctrl.get("Oem", {}).get("Hp", {}) or ctrl.get("Oem", {}).get("Hpe", {})
+                    lks_oem = oem_hpe.get("Links", {})
+                    physical_links += _get_links(lks_oem.get("PhysicalDrives"), host, user, passwd, session)
+                    logical_links  += _get_links(lks_oem.get("LogicalDrives"), host, user, passwd, session)
+
+                    # Deduplicar links
+                    physical_links = list(dict.fromkeys(physical_links))
+                    logical_links = list(dict.fromkeys(logical_links))
+
+                    # 2. Obtener DATA de discos físicos
+                    used_drive_links = set()
+                    for dl in physical_links:
                         try:
                             d = ilo_get(dl, host, user, passwd, session=session)
                             if not d: continue
-
-                            # Saltar volúmenes RAW (son el disco físico presentado como volumen,
-                            # ya están contados vía la ruta Drives - evita duplicados)
-                            if d.get("VolumeType") == "RawDevice":
-                                continue
                             
-                            # Intentar obtener capacidad de varias fuentes
+                            # Normalizar data del disco
                             bv = d.get("CapacityBytes")
                             if bv is None:
                                 mv = d.get("CapacityMiB")
                                 if mv: bv = mv * 1024 * 1024
-
-                            # CapacityGB — campo específico de HPE SmartStorage (iLO 4)
                             if not bv:
                                 gb = d.get("CapacityGB")
-                                if gb is not None: bv = float(gb) * 1000 * 1000 * 1000
-
-
-                            # Si sigue siendo 0 o None, intentamos sacar del nombre o descripción
+                                if gb is not None: bv = float(gb) * 1e9
+                            
+                            # Fallback Regex
                             if not bv:
-                                text_to_search = f"{d.get('Name','')} {d.get('Model','')} {d.get('Description','')}"
-                                import re
-                                match = re.search(r"(\d+)\s*(GB|TB|GiB|TiB)", text_to_search, re.I)
+                                text = f"{d.get('Name','')} {d.get('Model','')} {d.get('Description','')}"
+                                match = re.search(r"(\d+)\s*(GB|TB|GiB|TiB)", text, re.I)
                                 if match:
                                     val, unit = int(match.group(1)), match.group(2).upper()
-                                    mult = 1e12 if "T" in unit else 1e9
-                                    bv = val * mult
-
-                            # Sanity check: si CapacityBytes parece demasiado pequeño para un
-                            # disco de servidor (< 1 GB), intentar extraer capacidad del modelo.
-                            # Convención HPE: "MK000960GWUGH" → 960 GB (dígitos antes de 'G')
+                                    bv = val * (1e12 if "T" in unit else 1e9)
+                            
+                            # ✨ Especial iLO 4: Extraer capacidad del número de modelo (ej. MK000960 -> 960GB)
+                            # Si bv es muy bajo (menos de 1GB) o nulo, usamos el modelo
                             if not bv or bv < 1e9:
                                 model_str = d.get("Model") or d.get("Name") or ""
-                                import re as _re
-                                # Patrón HPE: 2 letras + ceros + capacidad en GB + G + letra
-                                m2 = _re.search(r"[A-Z]{2}0*(\d{2,4})G[A-Z]", model_str)
+                                # Busca patrones como "0960G" o "1.2T" en el modelo
+                                m2 = re.search(r"[A-Z]{2}0*(\d{2,4})G[A-Z]", model_str)
                                 if m2:
                                     bv = int(m2.group(1)) * 1e9
+                                else:
+                                    m3 = re.search(r"(\d+\.?\d*)\s*(GB|TB)", model_str, re.I)
+                                    if m3:
+                                        val, unit = float(m3.group(1)), m3.group(2).upper()
+                                        bv = val * (1e12 if "T" in unit else 1e9)
 
-                            drives.append({
-                                "name":        d.get("Name") or d.get("Id") or f"Drive {dl.split('/')[-1]}",
-                                "model":       d.get("Model") or d.get("Manufacturer") or "N/A",
-                                "capacity_gb": round((bv or 0) / 1000000000, 1), # Usar división estándar decimal por seguridad
-                                "type":        d.get("MediaType") or d.get("Protocol") or "N/A",
-                                "protocol":    d.get("Protocol", "N/A"),
-                                "health":      d.get("Status", {}).get("Health") or "OK",
+                            drive_obj = {
+                                "id": dl,
+                                "name": d.get("Name") or d.get("Id") or f"Disk {dl.split('/')[-1]}",
+                                "model": d.get("Model") or d.get("Manufacturer") or "N/A",
+                                "capacity_gb": round((bv or 0) / 1e9, 1),
+                                "type": d.get("MediaType") or d.get("Protocol") or "N/A",
+                                "health": d.get("Status", {}).get("Health") or "OK",
+                                "slot": d.get("PhysicalLocation",{}).get("PartLocation",{}).get("ServiceLabel") or d.get("Location")
+                            }
+                            all_drives_data[dl] = drive_obj
+                        except: continue
+
+                    # 3. Obtener DATA de volúmenes y agrupar
+                    groups = []
+                    for vl in logical_links:
+                        try:
+                            v = ilo_get(vl, host, user, passwd, session=session)
+                            if not v or v.get("VolumeType") == "RawDevice": continue
+                            
+                            v_drives = []
+                            v_drive_links = _get_links(v.get("Links", {}).get("Drives"), host, user, passwd, session)
+                            for vdl in v_drive_links:
+                                used_drive_links.add(vdl)
+                                if vdl in all_drives_data:
+                                    v_drives.append(all_drives_data[vdl])
+                            
+                            groups.append({
+                                "name": v.get("Name") or f"Array {v.get('Id')}",
+                                "health": v.get("Status", {}).get("Health") or "OK",
+                                "drives": v_drives
                             })
-
-                        except Exception: continue
+                        except: continue
+                    
+                    # 4. Discos no asignados (o si el mapeo falló)
+                    unassigned = []
+                    for dl, d_obj in all_drives_data.items():
+                        if dl not in used_drive_links:
+                            unassigned.append(d_obj)
+                    
+                    if unassigned:
+                        groups.append({
+                            "name": "Discos Independientes / No Asignados",
+                            "health": "OK",
+                            "drives": unassigned
+                        })
                     
                     controllers.append({
                         "name": ctrl.get("Name", "Controller"),
                         "health": ctrl.get("Status", {}).get("Health") or "OK",
-                        "drives": drives
+                        "groups": groups
                     })
                 except Exception: continue
         except Exception: continue
 
+        # Break si encontramos datos
+        if any(c["groups"] for c in controllers):
+            break
+
     if not controllers and prev_storage: return prev_storage
+
     return controllers
 
 def _fetch_memory_details(host, user, passwd, prev_memory=None, session=None):
@@ -209,6 +276,22 @@ def poll_server(srv, deep=True, prev_snap=None):
             "thermal": _safe_get("/Chassis/1/Thermal", host, user, passwd),
             "power":   _safe_get("/Chassis/1/Power",   host, user, passwd),
         }
+
+        # ── Fallback para iLO 4 (Sensores de ventilación) ──
+        # iLO 4 a veces no entrega lecturas en Redfish pero sí en /rest/v1
+        t_obj = r["thermal"]
+        fans_list = t_obj.get("Fans", [])
+        active_fans = [f for f in fans_list if f.get("Status", {}).get("State") != "Absent"]
+        
+        has_speed = any(f.get("Reading") is not None or f.get("CurrentReading") is not None for f in active_fans)
+        if active_fans and not has_speed:
+            try:
+                # Intentar API legacy de iLO 4
+                legacy_t = _safe_get("/rest/v1/chassis/1/thermal", host, user, passwd)
+                if legacy_t and legacy_t.get("Fans"):
+                    r["thermal"] = legacy_t
+            except Exception:
+                pass
         
         if deep:
             p_storage = prev_snap.get("storage_data") if prev_snap else None
@@ -255,11 +338,12 @@ def poll_server(srv, deep=True, prev_snap=None):
             except Exception:
                 total_cpu_threads = 0
 
-        # Calcular total de disco sumando todos los drives de todos los controladores
+        # Calcular total de disco sumando todos los drives de todos los grupos
         total_disk_gb = 0
         for ctrl_data in st:
-            for drive in ctrl_data.get("drives", []):
-                total_disk_gb += drive.get("capacity_gb", 0)
+            for group in ctrl_data.get("groups", []):
+                for drive in group.get("drives", []):
+                    total_disk_gb += drive.get("capacity_gb", 0)
 
         return {
             "server_id":      srv["id"],
