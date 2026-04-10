@@ -1,7 +1,7 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, Response
 from datetime import datetime, timezone
 from db import get_servers_col, get_status_actual
-from ilo import ilo_get, handle_errors
+from ilo import ilo_get, handle_errors, ilo_login
 from crypto import encrypt, decrypt, is_encrypted
 from monitor import poll_server, sync_server_to_db
 
@@ -174,3 +174,82 @@ def update_server(server_id):
 
     updated = col.find_one({"id": server_id})
     return jsonify(_pub(updated))
+
+
+# ── GET /api/servers/<id>/creds ─────────────────────────────────
+@bp.get("/api/servers/<int:server_id>/creds")
+def get_server_creds(server_id):
+    """
+    Retorna usuario y contraseña DESCIFRADOS.
+    Solo debe usarse para el asistente de consola remota.
+    """
+    col = get_servers_col()
+    srv = col.find_one({"id": server_id})
+    if not srv:
+        return jsonify({"error": "Servidor no encontrado"}), 404
+    
+    _, user, passwd = _get_creds(srv)
+    return jsonify({
+        "user": user,
+        "pass": passwd
+    })
+
+
+# ── GET /api/jirc/<id> ──────────────────────────────────
+@bp.get("/api/jirc/<server_id>")
+@handle_errors
+def get_server_jirc(server_id):
+    """
+    Genera un archivo JNLP (Java Web Start) para abrir la consola 
+    directamente sin login manual, usando un token de sesión.
+    """
+    # Convertir a int manualmente para evitar fallos de matching de Flask
+    try:
+        sid = int(server_id)
+    except:
+        return jsonify({"error": "ID de servidor inválido"}), 400
+
+    col = get_servers_col()
+    srv = col.find_one({"id": sid})
+    if not srv:
+        return jsonify({"error": "Servidor no encontrado"}), 404
+    
+    host, user, passwd = _get_creds(srv)
+    
+    # 1. Obtener Token de Sesión real del iLo
+    # Si ilo_login falla, handle_errors devolverá el error automáticamente
+    token = ilo_login(host, user, passwd)
+    
+    # 2. Construir el XML del JNLP
+    jnlp_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<jnlp spec="1.0+" codebase="https://{host}/irc">
+    <information>
+        <title>iLO Console - {srv['label']} ({host})</title>
+        <vendor>Hewlett Packard Enterprise</vendor>
+    </information>
+    <security>
+        <all-permissions/>
+    </security>
+    <resources>
+        <j2se version="1.5+"/>
+        <jar href="irc5.jar" main="true"/>
+    </resources>
+    <applet-desc name="iLO Remote Console" main-class="com.hp.ilo.ri.irc.IRC" width="1" height="1">
+        <param name="ipaddress" value="{host}"/>
+        <param name="sessionkey" value="{token}"/>
+    </applet-desc>
+</jnlp>
+"""
+    
+    safe_host = host.replace('.', '_').replace(':', '_')
+    filename = f"iLO_{safe_host}.jnlp"
+    
+    return Response(
+        jnlp_xml.strip(),
+        mimetype="application/x-java-jnlp-file",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache"
+        }
+    )

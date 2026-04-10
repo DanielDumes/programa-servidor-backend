@@ -1,17 +1,9 @@
 from flask import Blueprint, jsonify
 from db import get_status_actual
 from ilo import handle_errors
-from datetime import datetime
+from utils import calculate_power_metrics, serialize_date
 
 bp = Blueprint("metrics", __name__)
-
-def _serialize(obj):
-    if isinstance(obj, datetime):
-        # MongoDB almacena en UTC. Marcar con 'Z' si no tiene tzinfo para que JS lo interprete correctamente.
-        if obj.tzinfo is None:
-            return obj.isoformat() + "Z"
-        return obj.isoformat()
-    return obj
 
 @bp.get("/api/servers/<int:server_id>/summary")
 @handle_errors
@@ -25,7 +17,9 @@ def server_summary(server_id):
     s = snap.get("systems_raw", {})
     t = snap.get("thermal_raw", {})
     p = snap.get("power_raw", {})
-    ctrl = (p.get("PowerControl", [{}])[0]) if p.get("PowerControl") else {}
+    
+    # Usar utilidad compartida para calcular potencia
+    consumed_w, capacity_w = calculate_power_metrics(p)
 
     return jsonify({
         "summary": {
@@ -66,8 +60,8 @@ def server_summary(server_id):
         ],
 
         "power": {
-            "consumed_watts": ctrl.get("PowerConsumedWatts"),
-            "capacity_watts": ctrl.get("PowerCapacityWatts"),
+            "consumed_watts": consumed_w,
+            "capacity_watts": capacity_w,
             "power_supplies": [
                 {
                     "name":        ps.get("Name"),
@@ -78,7 +72,7 @@ def server_summary(server_id):
                 if ps.get("Status", {}).get("State") != "Absent"
             ],
         },
-        "last_updated": _serialize(snap.get("timestamp"))
+        "last_updated": serialize_date(snap.get("timestamp"))
     })
 
 @bp.get("/api/servers/<int:server_id>/storage")

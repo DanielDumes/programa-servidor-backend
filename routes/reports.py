@@ -10,11 +10,12 @@ routes/reports.py — Endpoints de reportes históricos con MongoDB
 """
 from flask import Blueprint, jsonify, request, Response
 from datetime import datetime, timezone, timedelta
-EC_TZ = timezone(timedelta(hours=-5)) # Ecuador Timezone
 import csv
 import io
 
 from db import get_snapshots, get_events, get_servers_col
+from config import EC_TZ
+from utils import serialize_date
 
 bp = Blueprint("reports", __name__)
 
@@ -28,12 +29,7 @@ def _serialize(doc):
         if k == "_id":
             out["_id"] = str(v)
         elif isinstance(v, datetime):
-            # MongoDB almacena en UTC. Si el datetime no tiene tzinfo (naive), marcarlo como UTC
-            # para que JavaScript lo convierta correctamente a hora local.
-            if v.tzinfo is None:
-                out[k] = v.isoformat() + "Z"  # 'Z' = UTC, ej: 2026-04-01T15:09:31.727Z
-            else:
-                out[k] = v.isoformat()         # ya tiene tz, respetar
+            out[k] = serialize_date(v)
         else:
             out[k] = v
     return out
@@ -164,10 +160,16 @@ def daily_report():
         
         # Serializar y asegurar campos obligatorios
         snapshots = []
+        fleet_map = {s["id"]: s for s in all_servers}
+
         for d in snapshots_raw:
             sd = _serialize(d)
-            if not sd.get("server_label"): sd["server_label"] = f"iLO {sd.get('server_id')}"
-            if not sd.get("server_host"):  sd["server_host"]  = "N/A"
+            srv_id = sd.get("server_id")
+            master = fleet_map.get(srv_id, {})
+            
+            if not sd.get("server_label"): sd["server_label"] = master.get("label") or f"iLO {srv_id}"
+            if not sd.get("server_host"):  sd["server_host"]  = master.get("host") or "N/A"
+            
             snapshots.append(sd)
             
         events = _events_in_range(day_start, day_end)

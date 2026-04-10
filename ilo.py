@@ -44,6 +44,26 @@ def ilo_get(path, host, user, passwd, retries=2, session=None):
                 continue
     raise last_err
 
+def ilo_login(host, user, passwd):
+    """
+    Crea una sesión en el iLO y devuelve el X-Auth-Token.
+    """
+    url = f"https://{host}/redfish/v1/SessionService/Sessions/"
+    body = {"UserName": user, "Password": passwd}
+    headers = {"Content-Type": "application/json"}
+    
+    try:
+        resp = requests.post(url, json=body, headers=headers, verify=False, timeout=ILO_TIMEOUT)
+        resp.raise_for_status()
+        token = resp.headers.get("X-Auth-Token")
+        if not token:
+            raise ValueError("No se recibió el token de autenticación")
+        return token
+    except requests.exceptions.RequestException as e:
+        if e.response is not None and e.response.status_code == 401:
+            raise ValueError("Credenciales inválidas")
+        raise e
+
 def handle_errors(f):
     @wraps(f)
     def wrapper(*args, **kwargs):

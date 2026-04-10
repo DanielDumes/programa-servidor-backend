@@ -12,7 +12,9 @@ from datetime import datetime, timezone
 from storage import load_servers
 from ilo import ilo_get
 from db import get_status_actual, get_historial, get_events
-from config import POLL_INTERVAL, HISTORY_SNAPSHOT_INTERVAL
+from config import POLL_INTERVAL, HISTORY_SNAPSHOT_INTERVAL, EC_TZ
+from utils import calculate_power_metrics, serialize_date
+from logger import logger
 
 # Estado previo en memoria para detectar cambios y controlar snapshots por hora
 _prev_states = {}   
@@ -68,43 +70,17 @@ def _fetch_storage_details(host, user, passwd, prev_storage=None, session=None):
     """
     controllers = []
     
-    # Rutas en orden de preferencia. Hacemos break en cuanto encontremos datos válidos.
     # iLO 5: /Storage devuelve todo. iLO 4: /Storage puede estar vacío y necesita SmartStorage.
     for path in ["/Systems/1/Storage", "/Systems/1/SmartStorage", "/Systems/1/SmartStorage/ArrayControllers"]:
-
         try:
             ctrl_links = _get_links(path, host, user, passwd, session)
+            if not ctrl_links: continue
+
             for cl in ctrl_links:
                 try:
                     ctrl = ilo_get(cl, host, user, passwd, session=session)
-                    # Buscar componentes (Drives, Volumes, LogicalDrives, PhysicalDrives)
-                    all_comp_links = []
                     
-                    # 1. Rutas estándar en la raíz del controlador
-                    all_comp_links += _get_links(ctrl.get("Drives"), host, user, passwd, session)
-                    all_comp_links += _get_links(ctrl.get("Volumes"), host, user, passwd, session)
-                    
-                    # 2. Rutas en objeto Links
-                    lks = ctrl.get("Links", {})
-                    all_comp_links += _get_links(lks.get("Drives"), host, user, passwd)
-                    all_comp_links += _get_links(lks.get("LogicalDrives"), host, user, passwd)
-                    all_comp_links += _get_links(lks.get("PhysicalDrives"), host, user, passwd)
-                    all_comp_links += _get_links(lks.get("DiskDrives"), host, user, passwd)  # iLO 4
-
-                    # 3. OEM-Specific (HPE SmartStorage)
-                    oem_hpe = ctrl.get("Oem", {}).get("Hp", {})
-                    if not oem_hpe: oem_hpe = ctrl.get("Oem", {}).get("Hpe", {})
-                    lks_oem = oem_hpe.get("Links", {})
-                    all_comp_links += _get_links(lks_oem.get("LogicalDrives"), host, user, passwd, session)
-                    all_comp_links += _get_links(lks_oem.get("PhysicalDrives"), host, user, passwd, session)
-
-                    # Deduplicar links
-                    all_comp_links = list(dict.fromkeys(all_comp_links))
-                    
-                    all_drives_data = {} # @odata.id -> data
-                    volumes_data = []    # list of volumes
-                    
-                    # 1. Obtener links de TODO
+                    # 1. Descubrir links de componentes (Físicos y Lógicos)
                     physical_links = []
                     logical_links = []
                     
@@ -112,24 +88,28 @@ def _fetch_storage_details(host, user, passwd, prev_storage=None, session=None):
                     physical_links += _get_links(ctrl.get("Drives"), host, user, passwd, session)
                     logical_links  += _get_links(ctrl.get("Volumes"), host, user, passwd, session)
                     
-                    # Rutas en Links
+                    # Rutas en el objeto Links
                     lks = ctrl.get("Links", {})
                     physical_links += _get_links(lks.get("Drives"), host, user, passwd)
                     physical_links += _get_links(lks.get("PhysicalDrives"), host, user, passwd)
                     physical_links += _get_links(lks.get("DiskDrives"), host, user, passwd)
                     logical_links  += _get_links(lks.get("LogicalDrives"), host, user, passwd)
-                    logical_links  += _get_links(lks.get("Volumes"), host, user, passwd) # redundante pero seguro
+                    logical_links  += _get_links(lks.get("Volumes"), host, user, passwd)
                     
-                    # OEM-Specific
-                    oem_hpe = ctrl.get("Oem", {}).get("Hp", {}) or ctrl.get("Oem", {}).get("Hpe", {})
-                    lks_oem = oem_hpe.get("Links", {})
-                    physical_links += _get_links(lks_oem.get("PhysicalDrives"), host, user, passwd, session)
-                    logical_links  += _get_links(lks_oem.get("LogicalDrives"), host, user, passwd, session)
+                    # Rutas OEM (HPE SmartStorage / iLO 4)
+                    oem = ctrl.get("Oem", {})
+                    oem_hpe = oem.get("Hp", {}) or oem.get("Hpe", {})
+                    if isinstance(oem_hpe, dict):
+                        lks_oem = oem_hpe.get("Links", {})
+                        physical_links += _get_links(lks_oem.get("PhysicalDrives"), host, user, passwd, session)
+                        logical_links  += _get_links(lks_oem.get("LogicalDrives"), host, user, passwd, session)
 
                     # Deduplicar links
                     physical_links = list(dict.fromkeys(physical_links))
                     logical_links = list(dict.fromkeys(logical_links))
-
+                    
+                    all_drives_data = {} # @odata.id -> data
+                    
                     # 2. Obtener DATA de discos físicos
                     used_drive_links = set()
                     for dl in physical_links:
@@ -306,7 +286,9 @@ def poll_server(srv, deep=True, prev_snap=None):
         if not s or not s.get("PowerState"):
             raise ValueError("Respuesta vacía del iLO")
 
-        ctrl = (p.get("PowerControl") or [{}])[0]
+        # ── Extracción de Watts (Usando utilidad compartida) ──
+        consumed_watts, capacity_watts = calculate_power_metrics(p)
+
         # ── Extracción de Temperaturas (Priorizar Inlet Ambient para Reportes) ──
         all_temps = t.get("Temperatures", [])
         inlet_temp = next((x.get("ReadingCelsius") for x in all_temps 
@@ -317,7 +299,6 @@ def poll_server(srv, deep=True, prev_snap=None):
             temps_raw = [x.get("ReadingCelsius") for x in all_temps 
                          if x.get("Status", {}).get("State") != "Absent" and x.get("ReadingCelsius") is not None]
             inlet_temp = max(temps_raw) if temps_raw else None
-
         
         fan_warn = sum(1 for f in t.get("Fans", []) 
                        if f.get("Status", {}).get("State") != "Absent" and f.get("Status", {}).get("Health") not in ("OK", None))
@@ -357,8 +338,8 @@ def poll_server(srv, deep=True, prev_snap=None):
             "health":         s.get("Status", {}).get("Health"),
             "health_rollup":  s.get("Status", {}).get("HealthRollup"),
             "power_state":    s.get("PowerState"),
-            "consumed_watts": ctrl.get("PowerConsumedWatts"),
-            "capacity_watts": ctrl.get("PowerCapacityWatts"),
+            "consumed_watts": consumed_watts,
+            "capacity_watts": capacity_watts,
             "max_temp_c":     inlet_temp,
 
             "fan_count":      len(t.get("Fans", [])),
@@ -507,13 +488,13 @@ def run_cycle():
                         try:
                             # Serializar fecha para el socket
                             ev_copy = ev.copy()
-                            if isinstance(ev_copy["timestamp"], datetime):
-                                ev_copy["timestamp"] = ev_copy["timestamp"].isoformat()
+                            ev_copy["timestamp"] = serialize_date(ev_copy["timestamp"])
                             _socketio.emit('new_alert', ev_copy, namespace='/')
                         except Exception as ex_emit:
-                            print(f"[Monitor] Error emitiendo socket: {ex_emit}")
+                            logger.error(f"Error emitiendo socket: {ex_emit}")
                     
-                    if ev["severity"] == "Critical": print(f"!!! ALERTA CRÍTICA: {ev['server_label']} - {ev['details']}")
+                    if ev["severity"] == "Critical":
+                        logger.critical(f"ALERTA CRÍTICA: {ev['server_label']} - {ev['details']}")
             
             _prev_states[srv_id] = {
                 "reachable":        snap["reachable"],
@@ -532,8 +513,10 @@ def run_cycle():
 def _monitor_loop():
     """Bucle infinito del hilo daemon."""
     while True:
-        try: run_cycle()
-        except Exception as e: print(f"[Monitor] Error fatal en ciclo: {e}")
+        try: 
+            run_cycle()
+        except Exception as e: 
+            logger.error(f"Error fatal en ciclo: {e}", exc_info=True)
         time.sleep(POLL_INTERVAL)
 
 
@@ -543,4 +526,4 @@ def start_monitor(socketio_instance=None):
     _socketio = socketio_instance
     t = threading.Thread(target=_monitor_loop, name="ilo-monitor", daemon=True)
     t.start()
-    print(f"[Monitor] Hilo iniciado (SocketIO {'Activado' if _socketio else 'Desactivado'}). Polling: {POLL_INTERVAL}s.")
+    logger.info(f"Hilo iniciado (SocketIO {'Activado' if _socketio else 'Desactivado'}). Polling: {POLL_INTERVAL}s.")
