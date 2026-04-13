@@ -6,11 +6,8 @@ Colecciones:
   - historial     : snapshots históricos (se guarda por cambio o cada 1 hora)
   - events        : log de cambios detectados (alertas)
 """
-import os
 from pymongo import MongoClient, ASCENDING, DESCENDING
-
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-DB_NAME   = "ilo_monitor"
+from config import MONGO_URI, DB_NAME
 
 _client = None
 

@@ -326,11 +326,38 @@ def poll_server(srv, deep=True, prev_snap=None):
                 for drive in group.get("drives", []):
                     total_disk_gb += drive.get("capacity_gb", 0)
 
+        # ── Detección de Generación iLO (4, 5, 6) ──────────────────
+        model_raw = (s.get("Model") or "").upper().replace(" ", "").replace("-", "")
+        # Intentar obtener versión real desde el firmware/OEM (más preciso)
+        fw_ver = str(s.get("Oem", {}).get("Hpe", {}).get("iLOVersion", "") or s.get("Oem", {}).get("Hp", {}).get("iLOVersion", "")).lower()
+        
+        ilo_gen = 5 # Default base
+        
+        if "ilo 4" in fw_ver:
+            ilo_gen = 4
+        elif "ilo 6" in fw_ver:
+            ilo_gen = 6
+        elif "ilo 5" in fw_ver:
+            ilo_gen = 5
+        else:
+            # Fallback por Modelo si el firmware no lo dice explícitamente
+            if "GEN8" in model_raw or "GEN9" in model_raw:
+                ilo_gen = 4
+            elif "GEN11" in model_raw:
+                ilo_gen = 6
+            elif "GEN10" in model_raw:
+                ilo_gen = 5
+            
+        # Fallback heurístico adicional para hardware muy antiguo
+        if ilo_gen == 5 and not s.get("UUID") and "GEN" in model_raw:
+            ilo_gen = 4
+
         return {
             "server_id":      srv["id"],
             "server_label":   srv["label"],
             "server_host":    host,
             "ilo_name":       ilo_name,
+            "ilo_gen":        ilo_gen,
             "total_mem_gb":   total_mem_gb,
             "total_storage_gb": round(total_disk_gb, 1),
             "total_cpu_threads": total_cpu_threads,

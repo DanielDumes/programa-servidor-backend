@@ -32,10 +32,11 @@ def trigger_test_alert():
 if __name__ == "__main__":
     from logger import logger
     from monitor import start_monitor
+    from config import PORT
     
-    logger.info("Iniciando backend del Dashboard de iLO...")
+    logger.info(f"Iniciando backend en el puerto {PORT}...")
     
-    # Arranca el monitor de fondo (pasamos socketio para alertas real-time)
+    # Arranca el monitor de fondo
     start_monitor(socketio)
 
-    socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
+    socketio.run(app, host="0.0.0.0", port=PORT, allow_unsafe_werkzeug=True)
