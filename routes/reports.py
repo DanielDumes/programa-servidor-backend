@@ -66,6 +66,14 @@ def weekly_report():
     except Exception as e:
         return jsonify({"error": f"No se pudo conectar a MongoDB: {str(e)}"}), 503
 
+    try:
+        from db import get_status_actual
+        cur_off = list(get_status_actual().find({"power_state": "Off"}, {"_id": 0, "server_label": 1, "server_host": 1, "timestamp": 1}))
+        for c in cur_off:
+            c["timestamp"] = serialize_date(c.get("timestamp"))
+    except Exception:
+        cur_off = []
+
     return jsonify({
         "metrics": {
             "total_events":    len(logs),
@@ -75,6 +83,7 @@ def weekly_report():
             "fan_events":      sum(1 for l in logs if l["type"] in ["FanWarning", "FanRecovery"]),
         },
         "logs": logs,
+        "off_servers": cur_off
     })
 
 

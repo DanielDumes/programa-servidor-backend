@@ -38,3 +38,68 @@ def serialize_date(dt):
             return dt.isoformat() + "Z"
         return dt.isoformat()
     return dt
+
+def format_server_summary(snap):
+    """Convierte un snapshot crudo de la DB en el formato JSON que espera el frontend."""
+    if not snap or not snap.get("reachable"):
+        return None
+
+    s = snap.get("systems_raw", {})
+    t = snap.get("thermal_raw", {})
+    p = snap.get("power_raw", {})
+    
+    consumed_w, capacity_w = calculate_power_metrics(p)
+
+    return {
+        "server_id": snap.get("server_id"),
+        "summary": {
+            "name":          s.get("HostName") or s.get("Name", "Servidor"),
+            "model":         s.get("Model", "N/A"),
+            "serial":        s.get("SerialNumber", "N/A"),
+            "bios_version":  s.get("BiosVersion", "N/A"),
+            "power_state":   s.get("PowerState", "Unknown"),
+            "health":        s.get("Status", {}).get("Health", "Unknown"),
+            "health_rollup": s.get("Status", {}).get("HealthRollup", "Unknown"),
+            "memory_gib":    s.get("MemorySummary", {}).get("TotalSystemMemoryGiB", 0),
+            "cpu_count":         s.get("ProcessorSummary", {}).get("Count", 0),
+            "logical_cpu_count": snap.get("total_cpu_threads") or s.get("ProcessorSummary", {}).get("LogicalProcessorCount", 0),
+            "cpu_model":         s.get("ProcessorSummary", {}).get("Model", "N/A"),
+        },
+        "temperatures": [
+            {
+                "name":           x.get("Name"),
+                "reading_c":      x.get("ReadingCelsius"),
+                "upper_caution":  x.get("UpperThresholdNonCritical"),
+                "upper_critical": x.get("UpperThresholdCritical"),
+                "health":         x.get("Status", {}).get("Health", "Unknown"),
+                "location":       x.get("PhysicalContext"),
+            }
+            for x in t.get("Temperatures", [])
+            if x.get("Status", {}).get("State") != "Absent"
+            and x.get("ReadingCelsius") is not None
+        ],
+        "fans": [
+            {
+                "name": f.get("Name") or f.get("FanName"),
+                "rpm": f.get("Reading") or f.get("CurrentReading"),
+                "health": f.get("Status", {}).get("Health"),
+                "units": f.get("Units") or f.get("ReadingUnits") or "RPM"
+            }
+            for f in t.get("Fans", [])
+            if f.get("Status", {}).get("State") != "Absent"
+        ],
+        "power": {
+            "consumed_watts": consumed_w,
+            "capacity_watts": capacity_w,
+            "power_supplies": [
+                {
+                    "name":        ps.get("Name"),
+                    "health":      ps.get("Status", {}).get("Health"),
+                    "power_watts": ps.get("LastPowerOutputWatts"),
+                }
+                for ps in p.get("PowerSupplies", [])
+                if ps.get("Status", {}).get("State") != "Absent"
+            ],
+        },
+        "last_updated": serialize_date(snap.get("timestamp"))
+    }

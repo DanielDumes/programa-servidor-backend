@@ -18,7 +18,7 @@ def setup_logger(name):
     logger.addHandler(console_handler)
 
     # Handler para archivo
-    file_handler = logging.FileHandler(LOG_FILE)
+    file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 

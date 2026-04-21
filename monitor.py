@@ -13,10 +13,11 @@ from storage import load_servers
 from ilo import ilo_get
 from db import get_status_actual, get_historial, get_events
 from config import POLL_INTERVAL, HISTORY_SNAPSHOT_INTERVAL, EC_TZ
-from utils import calculate_power_metrics, serialize_date
+from utils import calculate_power_metrics, serialize_date, format_server_summary
 from logger import logger
 
-# Estado previo en memoria para detectar cambios y controlar snapshots por hora
+# variables para Socket.IO
+_socketio = None
 _prev_states = {}   
 # { server_id: {"health": ..., "power_state": ..., "reachable": ..., "last_history_time": datetime} }
 _lock = threading.Lock()
@@ -440,7 +441,7 @@ def _detect_and_log_events(snapshot, prev):
             "server_label": snapshot["server_label"], "server": snapshot["server_host"],
             "type": "PowerStateChanged", "severity": severity,
             "old_status": prev_power, "new_status": curr_power,
-            "details": f"El servidor cambió de estado: {prev_power} → {curr_power}.",
+            "details": f"El servidor cambió de estado: {prev_power} -> {curr_power}.",
         })
 
     # ── 3. Ventiladores con fallo (fan_warn > 0 cuando antes era 0) ──────
@@ -470,17 +471,25 @@ def run_cycle():
     servers = load_servers()
     if not servers: return
 
-    now = datetime.now(timezone.utc)
     status_col, hist_col, events_col = get_status_actual(), get_historial(), get_events()
 
+    t_start = time.time()
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
         # Pasamos el estado previo a poll_server para permitir persistencia de datos
         def poll_wrapper(srv):
+            st = time.time()
             with _lock:
                 prev = _prev_states.get(srv["id"], {})
-            return poll_server(srv, deep=True, prev_snap=prev.get("full_snap"))
+            res = poll_server(srv, deep=True, prev_snap=prev.get("full_snap"))
+            dur = time.time() - st
+            logger.info(f"  -> [{srv['label']}] Polling finalizado en {dur:.2f}s")
+            return res
         
         results = list(ex.map(poll_wrapper, servers))
+
+    # Actualizamos el timestamp exacto tras finalizar todo el polling
+    now = datetime.now(timezone.utc)
 
     for snap in results:
         snap["timestamp"] = now
@@ -532,9 +541,23 @@ def run_cycle():
                 "full_snap":        snap if snap.get("reachable") else prev.get("full_snap")
             }
 
+    total_dur = time.time() - t_start
+    logger.info(f"[OK] Ciclo de monitoreo completado. Duración total: {total_dur:.2f}s.")
+
     # Emitir señal de fin de ciclo para refresco de UI en tiempo real
     if _socketio:
-        _socketio.emit('fleet_update', {"timestamp": now.isoformat()}, namespace='/')
+        # Buscamos el timestamp más reciente real en la base de datos para informar al frontend
+        latest_snap = status_col.find_one(sort=[("timestamp", -1)])
+        latest_ts = latest_snap["timestamp"] if latest_snap else now
+        
+        # Construir lista de resúmenes para empujar al frontend y evitar consultas extra
+        summaries = [format_server_summary(s) for s in results if s.get("reachable")]
+
+        _socketio.emit('fleet_update', {
+            "timestamp": serialize_date(latest_ts),
+            "summaries": summaries,
+            "any_reachable": any(s.get("reachable") for s in results)
+        }, namespace='/')
 
 
 def _monitor_loop():

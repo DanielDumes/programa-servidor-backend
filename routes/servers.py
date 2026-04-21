@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from db import get_servers_col, get_status_actual
 from ilo import handle_errors
 from crypto import encrypt, decrypt, is_encrypted
+from utils import serialize_date
 from monitor import poll_server, sync_server_to_db
 
 bp = Blueprint("servers", __name__)
@@ -58,8 +59,8 @@ def get_fleet_status():
         
         # Serializar fechas
         for d in docs:
-            if "timestamp" in d and isinstance(d["timestamp"], datetime):
-                d["timestamp"] = d["timestamp"].isoformat()
+            if "timestamp" in d:
+                d["timestamp"] = serialize_date(d["timestamp"])
                 
         return jsonify(docs)
     except Exception as e:
@@ -166,7 +167,7 @@ def update_server(server_id):
         if not snap.get("reachable"):
             return jsonify({"error": f"No se pudo conectar al iLO con los nuevos datos: {snap.get('error')}"}), 400
         
-        snap["timestamp"] = datetime.now()
+        snap["timestamp"] = datetime.now(timezone.utc)
         get_status_actual().replace_one({"server_id": server_id}, snap, upsert=True)
 
     if updates:

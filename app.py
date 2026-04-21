@@ -16,14 +16,15 @@ app.register_blueprint(reports_bp)
 # ── RUTA DE PRUEBA (SIMULACIÓN DE ALERTA) ──────────────────
 @app.get("/api/test-alert")
 def trigger_test_alert():
-    from datetime import datetime
+    from datetime import datetime, timezone
+    from utils import serialize_date
     test_ev = {
         "server_id": 999,
         "server_label": "SERVIDOR TEST (PRUEBA)",
         "type": "HealthDegradation",
         "severity": "Critical",
         "details": "Fallo simulado de Disco Duro - Sector Crítico 0x00FF8",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": serialize_date(datetime.now(timezone.utc))
     }
     socketio.emit('new_alert', test_ev, namespace='/')
     return {"ok": True, "message": "Alerta de prueba enviada al Dashboard"}

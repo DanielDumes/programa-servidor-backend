@@ -1,7 +1,7 @@
 from flask import Blueprint, jsonify
 from db import get_status_actual
 from ilo import handle_errors
-from utils import calculate_power_metrics, serialize_date
+from utils import calculate_power_metrics, serialize_date, format_server_summary
 
 bp = Blueprint("metrics", __name__)
 
@@ -11,69 +11,11 @@ def server_summary(server_id):
     col = get_status_actual()
     snap = col.find_one({"server_id": server_id}, {"_id": 0})
     
-    if not snap or not snap.get("reachable"):
+    formatted = format_server_summary(snap)
+    if not formatted:
         return jsonify({"error": "Datos no disponibles o servidor offline"}), 404
 
-    s = snap.get("systems_raw", {})
-    t = snap.get("thermal_raw", {})
-    p = snap.get("power_raw", {})
-    
-    # Usar utilidad compartida para calcular potencia
-    consumed_w, capacity_w = calculate_power_metrics(p)
-
-    return jsonify({
-        "summary": {
-            "name":          s.get("HostName") or s.get("Name", "Servidor"),
-            "model":         s.get("Model", "N/A"),
-            "serial":        s.get("SerialNumber", "N/A"),
-            "bios_version":  s.get("BiosVersion", "N/A"),
-            "power_state":   s.get("PowerState", "Unknown"),
-            "health":        s.get("Status", {}).get("Health", "Unknown"),
-            "health_rollup": s.get("Status", {}).get("HealthRollup", "Unknown"),
-            "memory_gib":    s.get("MemorySummary", {}).get("TotalSystemMemoryGiB", 0),
-            "cpu_count":         s.get("ProcessorSummary", {}).get("Count", 0),
-            "logical_cpu_count": snap.get("total_cpu_threads") or s.get("ProcessorSummary", {}).get("LogicalProcessorCount", 0),
-            "cpu_model":         s.get("ProcessorSummary", {}).get("Model", "N/A"),
-        },
-        "temperatures": [
-            {
-                "name":           x.get("Name"),
-                "reading_c":      x.get("ReadingCelsius"),
-                "upper_caution":  x.get("UpperThresholdNonCritical"),
-                "upper_critical": x.get("UpperThresholdCritical"),
-                "health":         x.get("Status", {}).get("Health", "Unknown"),
-                "location":       x.get("PhysicalContext"),
-            }
-            for x in t.get("Temperatures", [])
-            if x.get("Status", {}).get("State") != "Absent"
-            and x.get("ReadingCelsius") is not None
-        ],
-        "fans": [
-            {
-                "name": f.get("Name") or f.get("FanName"),
-                "rpm": f.get("Reading") or f.get("CurrentReading"),
-                "health": f.get("Status", {}).get("Health"),
-                "units": f.get("Units") or f.get("ReadingUnits") or "RPM"
-            }
-            for f in t.get("Fans", [])
-            if f.get("Status", {}).get("State") != "Absent"
-        ],
-
-        "power": {
-            "consumed_watts": consumed_w,
-            "capacity_watts": capacity_w,
-            "power_supplies": [
-                {
-                    "name":        ps.get("Name"),
-                    "health":      ps.get("Status", {}).get("Health"),
-                    "power_watts": ps.get("LastPowerOutputWatts"),
-                }
-                for ps in p.get("PowerSupplies", [])
-                if ps.get("Status", {}).get("State") != "Absent"
-            ],
-        },
-        "last_updated": serialize_date(snap.get("timestamp"))
-    })
+    return jsonify(formatted)
 
 @bp.get("/api/servers/<int:server_id>/storage")
 @handle_errors
@@ -100,4 +42,14 @@ def server_memory(server_id):
 @bp.get("/api/health")
 def health():
     from storage import load_servers
-    return jsonify({"status": "ok", "servers": len(load_servers())})
+    col = get_status_actual()
+    latest_snap = col.find_one(sort=[("timestamp", -1)])
+    latest_ts = None
+    if latest_snap and latest_snap.get("timestamp"):
+        latest_ts = serialize_date(latest_snap["timestamp"])
+        
+    return jsonify({
+        "status": "ok", 
+        "servers": len(load_servers()),
+        "last_fleet_update": latest_ts
+    })
